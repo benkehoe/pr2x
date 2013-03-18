@@ -75,25 +75,40 @@ class GripperTrajectoryThread(Thread):
             #duration_elapsed = rospy.Time.now() - t_start
             #print "%s %.4e, %.4e, %.4e"%(self.gripper.controller_name, self.angles[i], self.angles[i] - self.gripper.get_angle(),(rospy.Duration(self.times[i]) - duration_elapsed).to_sec())
 
+import inspect
+class MultiCaller(object):
+    def __init__(self,objs):
+        self.objs = objs
+        obj0 = objs[0]
+        for attr in dir(obj0):
+            if inspect.ismethod(getattr(obj0,attr)):
+                self.__getattr__(attr)
 
+    def __getattr__(self,name):
+        f = lambda *args: [getattr(obj,name)(*args) for obj in self.objs]
+        setattr(self,name,f)
+        return f
+
+                    
 class PR2(object):
 
     pending_threads = []
     wait = True # deprecated way of blocking / not blocking
 
     @once
-    def create(rave_only=False):
-        return PR2(rave_only)
+    def create(*args,**kwargs):
+        return PR2(*args,**kwargs)
 
-    def __init__(self, rave_only=False):
-
+    def __init__(self,rave_only=False,arms=True,grips=True,head=False,torso=False,base=False,sides='r'):
         # set up openrave
+        rospy.loginfo("Setting up OpenRAVE environment")
         self.env = rave.Environment()
         self.env.StopSimulation()
         self.env.Load("robots/pr2-beta-static.zae") # todo: use up-to-date urdf
         self.robot = self.env.GetRobots()[0]
 
         if not rave_only:
+            rospy.loginfo("Connecting to robot...")
             self.joint_listener = TopicListener("/joint_states", sm.JointState)
             self.tf_listener = ros_utils.get_tf_listener()
 
@@ -105,13 +120,54 @@ class PR2(object):
             self.rave_inds = inds_ros2rave[self.good_ros_inds] # openrave indices corresponding to those joints
             self.update_rave()
 
-            self.larm = Arm(self, "l")
-            self.rarm = Arm(self, "r")
-            self.lgrip = Gripper(self, "l")
-            self.rgrip = Gripper(self, "r")
-            self.head = Head(self)
-            self.torso = Torso(self)
-            self.base = Base(self)
+            if arms:
+                if 'l' in sides and 'r' in sides:
+                    print 'Setting up arms'
+                elif 'l' in sides:
+                    print 'Setting up left arm'
+                elif 'r' in sides:
+                    print 'Setting up right arm'
+                arm_list = []
+                if 'l' in sides:
+                    self.larm = Arm(self, "l")
+                    arm_list.append(self.larm)
+                if 'r' in sides:
+                    self.rarm = Arm(self, "r")
+                    arm_list.append(self.rarm)
+                self.arms = MultiCaller(arm_list)
+        
+            if grips:
+                if 'l' in sides and 'r' in sides:
+                    print 'Setting up grippers'
+                elif 'l' in sides:
+                    print 'Setting up left grippers'
+                elif 'r' in sides:
+                    print 'Setting up right grippers'
+                grip_list = []
+                if 'l' in sides:
+                    self.lgrip = Gripper(self, "l")
+                    grip_list.append(self.lgrip)
+                    if arms:
+                        self.larm.grip = self.lgrip
+                if 'r' in sides:
+                    self.rgrip = Gripper(self, "r")
+                    grip_list.append(self.rgrip)
+                    if arms:
+                        self.rarm.grip = self.rgrip
+                self.grips = MultiCaller(grip_list)
+        
+            if head:
+                print 'Setting up head'
+                self.head = Head(self)
+        
+            if torso:
+                print 'Setting up torso'
+                self.torso = Torso(self)
+        
+            if base:
+                print 'Setting up base'
+                self.base = Base(self)
+            rospy.loginfo('Connected to robot')
 
             ## make the joint limits match the PR2 soft limits
             #low_limits, high_limits = self.robot.GetDOFLimits()
@@ -337,7 +393,19 @@ class Arm(TrajectoryControllerWrapper):
     def cart_to_joint(self, matrix4, ref_frame, targ_frame, filter_options = 0):
         self.pr2.update_rave()
         return cart_to_joint(self.manip, matrix4, ref_frame, targ_frame, filter_options)
-
+    
+    def check_pose_matrix(self, matrix4, ref_frame, targ_frame, filter_options = 0):
+        """
+        IKFO_CheckEnvCollisions = 1
+        IKFO_IgnoreSelfCollisions = 2
+        IKFO_IgnoreJointLimits = 4
+        IKFO_IgnoreCustomFilters = 8
+        IKFO_IgnoreEndEffectorCollisions = 16
+        """                               
+        self.pr2.update_rave()
+        joint_positions = cart_to_joint(self.manip, matrix4, ref_frame, targ_frame, filter_options)
+        return (joint_positions is not None)
+    
     def goto_pose_matrix(self, matrix4, ref_frame, targ_frame, filter_options = 0): 
         """
         IKFO_CheckEnvCollisions = 1
@@ -401,7 +469,6 @@ class Torso(TrajectoryControllerWrapper):
 class Gripper(object):
     default_max_effort = 40
     def __init__(self,pr2,lr):
-        assert isinstance(pr2, PR2)
         self.pr2 = pr2
         self.lr = lr
         self.controller_name = "%s_gripper_controller"%self.lr
